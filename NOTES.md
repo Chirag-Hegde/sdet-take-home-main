@@ -1,15 +1,27 @@
 # Submission notes
 
-## Part A — API tests
+## At a glance
 
-Run with `npm test` (full suite, 30 tests — 26 pass, and the 4 tagged `@Bug` fail by design; see Part B) or `npm run test:smoke` (`@Healthcheck` tag only, one per spec file). `npm run test:green` excludes the intentional failures and is fully green. Playwright auto-starts the API. No files under `api/` were touched.
+| Command | What it runs | Expected result |
+|---|---|---|
+| `npm test` | Full suite (30 tests) | 26 pass, **4 fail by design** (`@Bug` regressions) |
+| `npm run test:green` | Everything except `@Bug` | All green |
+| `npm run test:bugs` | Only the `@Bug` regressions | 4 failures (the known bugs) |
+| `npm run test:smoke` | `@Healthcheck` tag only | All green |
+| `npm run k6:build` → `npm run k6:journey` | Part C load journey | All thresholds green |
+
+Playwright auto-starts the API. No files under `api/` were touched.
+
+---
+
+## Part A — API tests
 
 ### What was added
 
 | File | Status | Purpose |
 |------|--------|---------|
 | `tests/api/reminders/Reminders_Schema.ts` | tightened | Strict Zod schemas: id pattern, ISO datetimes, closed objects; added `NotFoundErrorSchema` (404) and `ValidationErrorSchema` (400). Every response body is parsed through a schema, not just status-checked. |
-| `tests/api/reminders/Reminders_Factory.ts` | new | `buildReminder(overrides)` — builds valid create payloads. Override a field with `undefined` to drop it in negative tests (JSON.stringify omits it). |
+| `tests/api/reminders/Reminders_Factory.ts` | new | `buildReminder(overrides)` — builds valid, unique create payloads. Override a field with `undefined` to drop it in negative tests (JSON.stringify omits it). |
 | `tests/api/reminders/Reminders_List.spec.ts` | extended | Pagination (defaults, disjoint pages, out-of-range, invalid params), status filter (Open/Done/unknown value), sort asc on both fields. |
 | `tests/api/reminders/Reminders_Create.spec.ts` | new | Happy path + default status, round-trip via GET by id, explicit `Done`, and 400 validation table (missing/whitespace/invalid fields, empty body). |
 | `tests/api/reminders/Reminders_GetById.spec.ts` | new | Seeded fetch with full shape check, 404 for unknown id, exact-string id matching. |
@@ -23,11 +35,20 @@ The existing `Reminders_API.ts` wrapper already covered all endpoints and is use
 - **`notes` never appears in output.** It is not asserted by equality (a failure diff would print it); the round-trip test compares it as a boolean, and the fixture redacts it from failure messages.
 - **Known bugs are fenced off, not papered over.** `order=desc`, the `total` field, and empty/non-string `title` acceptance are real API bugs. Part A deliberately does not assert on them (noted in spec headers); each gets a dedicated failing regression test in Part B.
 
+---
+
 ## Part B — bugs and regression tests
 
 ### Bugs found
 
-All verified over HTTP against a fresh server. Expected behavior cites [API_REFERENCE.md](./API_REFERENCE.md).
+| # | Endpoint | Bug | Expected | Actual |
+|---|----------|-----|----------|--------|
+| 1 | `GET /reminders` | `total` is the page length, not the count of all matches | `total: 25` | `total: 5` (= pageSize) |
+| 2 | `GET /reminders` | `order=desc` accepted but ignored | descending | always ascending |
+| 3 | `POST /reminders/{id}/complete` | unknown id not rejected | `404` | `200` with body `{}` |
+| 4 | `POST /reminders` | empty / non-string `title` accepted | `400` | `201`, record created |
+
+All verified over HTTP against a fresh server. Expected behavior cites [API_REFERENCE.md](./API_REFERENCE.md). Full repros:
 
 **BUG-1 — `total` is the current page's length, not the count of all matches.**
 - Repro: `GET /reminders?pageSize=5` → `total: 5`. Expected `total: 25` (reference: "total number of reminders that match the current filter, across all pages").
@@ -51,10 +72,6 @@ Alongside the bug hunt, `tests/api/reminders/Reminders_Complete.spec.ts` (passin
 
 `tests/api/reminders/Reminders_KnownBugs.spec.ts` — one test per bug, tagged `@Bug`. **They fail today on purpose**: each asserts the documented contract exactly where the implementation breaks it, so it goes green when the bug is fixed and guards it afterwards.
 
-- `npm run test:bugs` → only the regressions (expect **4 failures**).
-- `npm run test:green` → everything else (expect **all green**).
-- `npm test` → both; the only failures are the four tagged `@Bug`.
-
 Design decisions:
 
 - **Failure-proof anchors.** Counts can only grow mid-run (no delete endpoint; Done records are never reopened), so BUG-1 asserts lower bounds from the seed (`total >= 25`, filtered `>= 5`) and BUG-2 asserts "non-increasing order" rather than exact ids. The tests can only fail because of the bugs, never because parallel tests created data.
@@ -63,17 +80,47 @@ Design decisions:
 - **The non-string-title variant of BUG-4 is documented but not automated**: the junk record it would create poisons every schema-validating list test in the shared store for the rest of the run. It belongs in a serially-run project against a dedicated server instance.
 - Fix sketches (not applied): compute `total` from the filtered array before slicing; multiply the sort comparator by `-1` when `order === 'desc'`; early-return `404` in the complete handler; give `title` the same `typeof`+trim check as `patientName`.
 
+---
+
 ## Part C — load smoke
 
 Scenario: `load/scenarios/reminders-journey.ts`. Run: `npm run api` → `npm run k6:build` → `npm run k6:journey`.
 
-The journey models a clinician working their open reminders: search (`GET /reminders?status=Open&page=1&pageSize=5`) → next page → open one detail (`GET /reminders/{id}`, id picked from the page just viewed), with 1–3s of think time between steps. It is read-only on purpose: the store is in-memory with no delete, so a write-heavy smoke would grow the dataset over the run and skew the latency it is trying to measure.
+**The journey** models a clinician working their open reminders, with 1–3s of think time between steps:
 
-Custom metrics: `journey_duration` (a Trend: HTTP time of the three requests, think time excluded — it measures the API, not the sleeps) and `journey_errors` (a Rate: journeys where any step failed a check). Thresholds fail the run if blown: `http_req_duration p(95)<300ms`, `http_req_failed rate<1%`, `journey_duration p(95)<900ms` (3 × the per-request budget), `journey_errors rate<1%`.
+```
+search open reminders  →  next page  →  open one detail
+GET /reminders?status=Open   page=2      GET /reminders/{id}
+```
 
-**Results** (2 VUs, 30s, fresh server — Apple Silicon laptop, localhost): 12 journeys / 36 requests, 60/60 checks passed, all thresholds green. `http_req_duration` p95 **1.89ms** (avg 1.28ms, max 2.31ms); `journey_duration` p95 **4.93ms**; 0% errors.
+It is read-only on purpose: the store is in-memory with no delete, so a write-heavy smoke would grow the dataset over the run and skew the latency it is trying to measure.
 
-**Reading:** healthy, as expected — single-digit-millisecond p95 with a flat distribution (max ≈ 2× median, no tail), zero failures, and the journey p95 is almost exactly 3× the per-request p95, meaning no step is an outlier. At 2 VUs with think time this is a functional smoke plus a latency *baseline*, not a capacity statement. What I'd dig into next: ramp VUs in stages to find where p95 bends; a sustained write-mix soak to watch the in-memory array's growth push the O(n) per-request sort and `find` up; and the uncapped `pageSize` (one `?pageSize=100000`-style request against a grown store is the cheapest way for a client to hurt everyone's latency).
+**Custom metrics:** `journey_duration` (Trend: HTTP time of the three requests, think time excluded — it measures the API, not the sleeps) and `journey_errors` (Rate: journeys where any step failed a check).
+
+### Results
+
+Run profile: **2 VUs x 30s**, fresh server, localhost (Apple Silicon laptop) — 12 journeys, 36 requests, 60/60 checks passed.
+
+| Metric | Budget (threshold) | Actual | Verdict |
+|---|---|---|---|
+| `http_req_duration` p95 (per request) | < 300 ms | **1.89 ms** | ✅ pass |
+| `http_req_failed` (transport/HTTP errors) | < 1% | **0%** | ✅ pass |
+| `journey_duration` p95 (custom, whole journey) | < 900 ms | **4.93 ms** | ✅ pass |
+| `journey_errors` (custom, failed journeys) | < 1% | **0%** | ✅ pass |
+
+Supporting numbers: `http_req_duration` avg 1.28 ms, max 2.31 ms.
+
+### Reading the results
+
+Healthy, as expected — single-digit-millisecond p95 with a flat distribution (max ≈ 2x median, no tail), zero failures, and the journey p95 is almost exactly 3x the per-request p95, meaning no step is an outlier. At 2 VUs with think time this is a functional smoke plus a latency *baseline*, not a capacity statement.
+
+What I'd dig into next:
+
+- **Ramp VUs in stages** to find where p95 bends.
+- **A sustained write-mix soak** to watch the in-memory array's growth push the O(n) per-request sort and `find` up.
+- **The uncapped `pageSize`** — one `?pageSize=100000`-style request against a grown store is the cheapest way for a client to hurt everyone's latency.
+
+---
 
 ## What I'd do next with more time
 
