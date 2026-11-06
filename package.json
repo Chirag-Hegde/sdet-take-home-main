@@ -1,0 +1,26 @@
+{
+  "name": "sdet-take-home",
+  "version": "1.0.0",
+  "description": "TrendConnect test automation take-home: Reminders API",
+  "private": true,
+  "scripts": {
+    "api": "node api/server.js",
+    "test": "playwright test",
+    "test:smoke": "playwright test --grep @Healthcheck",
+    "test:green": "playwright test --grep-invert @Bug",
+    "test:bugs": "playwright test --grep @Bug",
+    "k6:build": "node load/esbuild.config.mjs",
+    "k6:smoke": "k6 run load/dist/reminders-smoke.js",
+    "k6:journey": "k6 run load/dist/reminders-journey.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0",
+    "@types/k6": "^1.0.0",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "zod": "^3.23.0"
+  }
+}
